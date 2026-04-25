@@ -75,7 +75,7 @@ function RoutineContent({ summary, content }) {
         <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-widest mb-2">Overview</p>
         <p className="text-sm text-[#4a5568] leading-relaxed">{summary}</p>
       </div>
-      <div className="px-6 py-5 border-b border-gray-50 grid grid-cols-2 gap-6">
+      <div className="px-6 py-5 border-b border-gray-50 grid grid-cols-1 sm:grid-cols-2 gap-6">
         {[['morning', '☀', 'amber'], ['evening', '☾', 'indigo']].map(([period, icon, color]) => (
           <div key={period}>
             <p className={`text-[10px] font-semibold text-${color}-500 uppercase tracking-widest mb-3`}>
@@ -226,7 +226,7 @@ function MessageCard({ msg }) {
 
 function NewsSidebar({ articles, loading, onClose }) {
   return (
-    <div className="fixed inset-y-0 right-0 w-[380px] bg-white/95 backdrop-blur-md shadow-2xl flex flex-col z-50 slide-in-right">
+    <div className="fixed inset-y-0 right-0 w-full sm:w-[380px] bg-white/95 backdrop-blur-md shadow-2xl flex flex-col z-50 slide-in-right">
       <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
         <h2 className="text-sm font-semibold text-[#2d3748]">Latest News</h2>
         <button
@@ -382,8 +382,17 @@ function MainPage() {
     <div className="h-screen flex flex-col overflow-hidden" style={{ background: 'linear-gradient(180deg, #9fb9c8 0%, #b5cad6 18%, #ccdae0 35%, #e5e9ec 50%, #f0e4d8 68%, #f4d6c0 84%, #f2caa8 100%)' }}>
 
       {/* Nav */}
-      <nav className="shrink-0 flex items-center justify-between px-6 py-4">
-        <span className="text-xl font-semibold text-[#2d3748] tracking-tight">DermaMind</span>
+      <nav className="shrink-0 flex items-center justify-between px-4 sm:px-6 py-4">
+        <div className="flex items-center gap-3">
+          <span className="text-xl font-semibold text-[#2d3748] tracking-tight">DermaMind</span>
+          {/* New Chat button visible only on mobile (sidebar hidden) */}
+          <button
+            onClick={startNewChat}
+            className="sm:hidden flex items-center gap-1 px-2.5 py-1 rounded-full border border-[#2d3748]/20 text-xs text-[#4a5568] hover:bg-white/50 transition-all"
+          >
+            + New
+          </button>
+        </div>
         <button
           onClick={toggleNews}
           className={`px-4 py-1.5 rounded-full text-sm font-medium transition-all ${
@@ -399,8 +408,8 @@ function MainPage() {
       {/* Body */}
       <div className="flex flex-1 min-h-0">
 
-        {/* Left sidebar — always visible */}
-        <aside className="w-52 shrink-0 border-r border-white/40 overflow-y-auto bg-white/10">
+        {/* Left sidebar — hidden on mobile, visible sm+ */}
+        <aside className="hidden sm:flex sm:flex-col w-52 shrink-0 border-r border-white/40 overflow-y-auto bg-white/10">
           <div className="px-2.5 pt-6 pb-2.5">
             <button
               onClick={startNewChat}
@@ -431,13 +440,13 @@ function MainPage() {
         <main className="flex-1 flex flex-col min-h-0">
 
           {/* Scrollable messages area */}
-          <div ref={scrollRef} className="flex-1 overflow-y-auto">
+          <div ref={scrollRef} className="flex-1 overflow-y-auto flex flex-col">
             {messages.length === 0 ? (
-              <div className="flex flex-col items-center justify-center text-center px-4" style={{ minHeight: 'calc(100vh - 260px)' }}>
-                <h1 className="text-4xl font-bold text-[#2d3748] mb-3 leading-tight">
+              <div className="flex-1 flex flex-col items-center justify-center text-center px-4">
+                <h1 className="text-2xl sm:text-4xl font-bold text-[#2d3748] mb-3 leading-tight">
                   Your Skin, Backed by Science
                 </h1>
-                <p className="text-lg text-[#718096] max-w-md leading-relaxed">
+                <p className="text-base sm:text-lg text-[#718096] max-w-md leading-relaxed">
                   Ask DermaMind about ingredients, routines, and the research behind them
                 </p>
               </div>
@@ -517,7 +526,7 @@ function MainPage() {
       {showScrollTop && (
         <button
           onClick={() => scrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
-          className="fixed bottom-8 right-8 w-11 h-11 rounded-full bg-white shadow-lg border border-gray-100 flex items-center justify-center text-violet-400 hover:text-violet-600 hover:shadow-xl transition-all z-30"
+          className="fixed bottom-4 right-4 sm:bottom-8 sm:right-8 w-11 h-11 rounded-full bg-white shadow-lg border border-gray-100 flex items-center justify-center text-violet-400 hover:text-violet-600 hover:shadow-xl transition-all z-30"
         >
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
             <path d="M8 12V4M8 4L4 8M8 4l4 4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
