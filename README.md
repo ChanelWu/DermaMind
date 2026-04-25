@@ -4,6 +4,8 @@
 
 DermaMind is an AI-powered skincare education app that answers questions about ingredients, routines, and the research behind them. Built on Claude (Anthropic), it delivers structured, evidence-based responses tailored to your skin type and specific concerns.
 
+## 🌐 Live Demo
+👉 https://dermamind.zeabur.app
 ---
 
 > ⚠️ **Disclaimer**
