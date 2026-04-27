@@ -1,11 +1,14 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import anthropic
 import json
 from dotenv import load_dotenv
 import os
 import asyncio
+import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
@@ -14,11 +17,55 @@ app = FastAPI(title="DermaMind API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "https://dermamind.zeabur.app"],    
+    allow_origins=["http://localhost:5173", "http://localhost:3000", "https://dermamind.zeabur.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── rate limiting ──────────────────────────────────────────────────────────────
+
+RATE_LIMIT = 10        # max requests
+RATE_WINDOW = 3600     # per hour (seconds)
+
+# { ip: [timestamp, timestamp, ...] }
+_rate_store: dict[str, list[float]] = defaultdict(list)
+
+
+def _get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    # Skip rate limiting for health checks
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    ip = _get_client_ip(request)
+    now = time.time()
+    window_start = now - RATE_WINDOW
+
+    # Drop timestamps outside the current window
+    _rate_store[ip] = [t for t in _rate_store[ip] if t > window_start]
+
+    if len(_rate_store[ip]) >= RATE_LIMIT:
+        oldest = _rate_store[ip][0]
+        retry_after = int(oldest + RATE_WINDOW - now) + 1
+        return JSONResponse(
+            status_code=429,
+            content={
+                "detail": "Rate limit exceeded. Please try again later.",
+                "retry_after_seconds": retry_after,
+            },
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    _rate_store[ip].append(now)
+    return await call_next(request)
 
 client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 MODEL = "claude-sonnet-4-5"
@@ -194,7 +241,6 @@ def _web_search_articles() -> list:
     except Exception as e:
         print(f"[articles] First attempt failed: {e!r}, retrying in 2s...")
 
-    import time
     time.sleep(2)
 
     try:
