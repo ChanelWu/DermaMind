@@ -200,7 +200,7 @@ async def _generate_json(instructions, user_input):
             get_client().responses.create,
             model=MODEL,
             instructions=instructions,
-            input=user_input,
+            input=user_input + "\n\nReturn your answer as a JSON object.",
             text={"format": {"type": "json_object"}},
             reasoning={"effort": "low"},
             max_output_tokens=4000,
