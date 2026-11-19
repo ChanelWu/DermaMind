@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-import anthropic
+import openai
 import json
 import re
 from dotenv import load_dotenv
@@ -10,19 +10,12 @@ import os
 import asyncio
 import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from functools import lru_cache
 
 load_dotenv()
 
 app = FastAPI(title="DermaMind API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "https://dermamind.zeabur.app"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ── rate limiting ──────────────────────────────────────────────────────────────
 
@@ -43,7 +36,7 @@ def _get_client_ip(request: Request) -> str:
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     # Skip rate limiting for health checks
-    if request.url.path == "/health":
+    if request.url.path == "/health" or request.method == "OPTIONS":
         return await call_next(request)
 
     ip = _get_client_ip(request)
@@ -116,13 +109,24 @@ def validate_input(text: str, field: str = "Input") -> str:
             detail=f"{field} must be {MAX_INPUT_LENGTH} characters or fewer.",
         )
     cleaned = _sanitize(text)
+    if not cleaned:
+        raise HTTPException(status_code=400, detail=f"{field} cannot be empty")
     if _check_injection(cleaned):
         raise HTTPException(status_code=400, detail="Invalid input detected.")
     return cleaned
 
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-MODEL = "claude-sonnet-4-5"
+MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+NEWS_MODEL = os.getenv("OPENAI_NEWS_MODEL", MODEL)
+
+
+@lru_cache(maxsize=1)
+def get_client():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise HTTPException(status_code=503, detail="AI service is not configured yet.")
+    return openai.OpenAI(api_key=api_key, timeout=60.0, max_retries=1)
+
 
 ANALYZE_SYSTEM = """\
 You are DermaMind, an educational skincare science assistant. \
@@ -178,76 +182,105 @@ class IngredientRequest(BaseModel):
     name: str
 
 
+def _parse_response(response):
+    if response.status != "completed":
+        raise ValueError("Incomplete AI response")
+    text = response.output_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^`{3}(?:json)?\s*|\s*`{3}$", "", text).strip()
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("Expected a JSON object")
+    return data
+
+
+async def _generate_json(instructions, user_input):
+    try:
+        response = await asyncio.to_thread(
+            get_client().responses.create,
+            model=MODEL,
+            instructions=instructions,
+            input=user_input,
+            text={"format": {"type": "json_object"}},
+            reasoning={"effort": "low"},
+            max_output_tokens=4000,
+            store=False,
+        )
+        return _parse_response(response), response.usage
+    except openai.APIError:
+        raise HTTPException(status_code=502, detail="AI service unavailable. Please try again.")
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=502, detail="Unreadable AI response. Please try again.")
+
+
 @app.post("/analyze")
 async def analyze_skin(request: AnalyzeRequest):
-    if not request.query.strip():
-        raise HTTPException(status_code=400, detail="Query cannot be empty")
     query = validate_input(request.query, field="Query")
-
-    try:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=1000,
-            system=[
-                {
-                    "type": "text",
-                    "text": ANALYZE_SYSTEM,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": query}],
-        )
-        raw = next((b.text for b in response.content if b.type == "text"), "{}")
-        start, end = raw.find("{"), raw.rfind("}") + 1
-        data = json.loads(raw[start:end]) if start != -1 and end > start else {}
-        return {
-            "analysis": data,
-            "usage": {
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
-                "cache_read_input_tokens": getattr(response.usage, "cache_read_input_tokens", 0),
-                "cache_creation_input_tokens": getattr(response.usage, "cache_creation_input_tokens", 0),
-            },
-        }
-    except anthropic.APIError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=502, detail=f"Invalid JSON from model: {e}")
+    data, usage = await _generate_json(ANALYZE_SYSTEM, query)
+    kind = data.get("type")
+    content = data.get("content")
+    valid = (
+        kind in {"routine", "ingredient", "general", "concern"}
+        and isinstance(data.get("summary"), str)
+        and isinstance(content, dict)
+    )
+    if valid:
+        if kind == "routine":
+            valid = all(
+                isinstance(content.get(k), list)
+                and all(isinstance(x, dict) and all(isinstance(x.get(f), str)
+                        for f in ("step", "why")) for x in content[k])
+                for k in ("morning", "evening")
+            )
+        elif kind == "general":
+            valid = isinstance(content.get("answer"), str)
+        elif kind == "ingredient":
+            valid = all(isinstance(content.get(k), str)
+                        for k in ("mechanism", "evidence_tier", "concentration"))
+            valid = valid and isinstance(content.get("best_for"), list)
+        else:
+            valid = isinstance(content.get("explanation"), str)
+            valid = valid and isinstance(content.get("ingredients"), list) and all(
+                isinstance(x, dict) and all(isinstance(x.get(k), str)
+                for k in ("name", "function", "evidence_tier"))
+                for x in content.get("ingredients", [])
+            )
+    if not valid:
+        raise HTTPException(status_code=502, detail="Unexpected AI response format. Please try again.")
+    data["disclaimer"] = (
+        "Educational purposes only. DermaMind is not a substitute for medical advice, "
+        "diagnosis, or treatment. Consult a qualified dermatologist for personal advice."
+    )
+    return {
+        "analysis": data,
+        "usage": {
+            "input_tokens": getattr(usage, "input_tokens", 0),
+            "output_tokens": getattr(usage, "output_tokens", 0),
+            "cache_read_input_tokens": getattr(
+                getattr(usage, "input_tokens_details", None), "cached_tokens", 0),
+            "cache_creation_input_tokens": 0,
+        },
+    }
 
 
 @app.post("/ingredient")
 async def ingredient_breakdown(request: IngredientRequest):
-    name = request.name.strip()
-    if not name:
-        raise HTTPException(status_code=400, detail="Ingredient name cannot be empty")
-    name = validate_input(name, field="Ingredient name")
-
+    name = validate_input(request.name, field="Ingredient name")
     cache_key = name.lower()
     if cache_key in _ingredient_cache:
         return {"ingredient": name, "cached": True, "data": _ingredient_cache[cache_key]}
-
-    try:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=600,
-            system=[
-                {
-                    "type": "text",
-                    "text": INGREDIENT_SYSTEM,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            messages=[{"role": "user", "content": name}],
-        )
-        raw = next((b.text for b in response.content if b.type == "text"), "{}")
-        start, end = raw.find("{"), raw.rfind("}") + 1
-        data = json.loads(raw[start:end]) if start != -1 and end > start else {}
-        _ingredient_cache[cache_key] = data
-        return {"ingredient": name, "cached": False, "data": data}
-    except anthropic.APIError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=502, detail=f"Invalid JSON from model: {e}")
+    data, _ = await _generate_json(INGREDIENT_SYSTEM, name)
+    if not (
+        all(isinstance(data.get(k), str) for k in ("function", "mechanism", "evidence_tier"))
+        and all(isinstance(data.get(k), list) and all(isinstance(x, str) for x in data[k])
+                for k in ("key_studies", "best_for"))
+    ):
+        raise HTTPException(status_code=502, detail="Unexpected ingredient response. Please try again.")
+    data["disclaimer"] = "Educational purposes only. Consult a dermatologist for personal advice."
+    if len(_ingredient_cache) >= 500:
+        _ingredient_cache.pop(next(iter(_ingredient_cache)))
+    _ingredient_cache[cache_key] = data
+    return {"ingredient": name, "cached": False, "data": data}
 
 
 FALLBACK_ARTICLES = [
@@ -275,64 +308,82 @@ FALLBACK_ARTICLES = [
 ]
 
 
-def _fetch_articles_once() -> list:
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=1500,
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        messages=[{
-            "role": "user",
-            "content": (
-                "skincare anti-aging serum retinol collagen news 2025. "
-                "Respond with a JSON array only — no prose, no markdown fences. "
-                "Each item must have exactly these keys: title, source, date, url, summary "
-                "(summary is one sentence description of the article)."
-            ),
-        }],
+def _fetch_articles_once():
+    today = datetime.now(timezone.utc).date().isoformat()
+    response = get_client().responses.create(
+        model=NEWS_MODEL,
+        tools=[{"type": "web_search"}],
+        tool_choice="required",
+        reasoning={"effort": "low"},
+        max_output_tokens=6000,
+        store=False,
+        input=(
+            f"Today is {today}. Search for up to five recent skincare research or "
+            "dermatology news articles. Return only a JSON object with an articles array. "
+            "Each article must contain string fields: title, source, date, url, summary. "
+            "Use real source URLs you found, accurate dates, and one-sentence summaries. "
+            "Never invent citations or URLs. If no suitable results exist, return an empty array."
+        ),
     )
-    raw = next((b.text for b in response.content if b.type == "text"), "[]")
-    start, end = raw.find("["), raw.rfind("]") + 1
-    return json.loads(raw[start:end]) if start != -1 and end > start else []
+    data = _parse_response(response)
+    items = data.get("articles", [])
+    if not isinstance(items, list):
+        raise ValueError("Invalid articles response")
+    valid = [
+        x for x in items if isinstance(x, dict)
+        and all(isinstance(x.get(k), str) for k in ("title", "source", "date", "url", "summary"))
+        and x["url"].startswith(("https://", "http://"))
+    ]
+    if not valid:
+        raise ValueError("No valid articles returned")
+    return valid[:5]
 
 
-def _web_search_articles() -> list:
-    try:
-        items = _fetch_articles_once()
-        if items:
-            return items
-        print("[articles] First attempt returned empty, retrying in 2s...")
-    except Exception as e:
-        print(f"[articles] First attempt failed: {e!r}, retrying in 2s...")
-
-    time.sleep(2)
-
-    try:
-        items = _fetch_articles_once()
-        if items:
-            return items
-        print("[articles] Retry also returned empty, using fallback.")
-    except Exception as e:
-        print(f"[articles] Retry failed: {e!r}, using fallback.")
-
-    return FALLBACK_ARTICLES
+_articles_cache = []
+_articles_cache_until = 0.0
+_articles_lock = asyncio.Lock()
 
 
 @app.get("/articles")
 async def get_articles():
-    try:
-        loop = asyncio.get_event_loop()
-        with ThreadPoolExecutor() as pool:
-            items = await loop.run_in_executor(pool, _web_search_articles)
-        return {"articles": items[:5]}
-    except Exception as e:
-        print(f"[articles] Unexpected error in endpoint: {e!r}")
-        return {"articles": FALLBACK_ARTICLES}
+    global _articles_cache, _articles_cache_until
+    async with _articles_lock:
+        if time.monotonic() < _articles_cache_until:
+            return {"articles": _articles_cache}
+        try:
+            _articles_cache = await asyncio.to_thread(_fetch_articles_once)
+            _articles_cache_until = time.monotonic() + 3600
+        except (openai.APIError, ValueError, TypeError, HTTPException):
+            # Keep the original fallback content if live search is unavailable.
+            _articles_cache = _articles_cache or FALLBACK_ARTICLES
+            _articles_cache_until = time.monotonic() + 60
+        return {"articles": _articles_cache}
 
 
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
+        "provider": "openai",
         "model": MODEL,
-        "api_key_configured": bool(os.getenv("ANTHROPIC_API_KEY")),
+        "api_key_configured": bool(os.getenv("OPENAI_API_KEY")),
     }
+
+
+# Add CORS last so it also decorates rate-limit responses.
+# In Render set ALLOWED_ORIGINS to the exact frontend URL (no trailing slash).
+allowed_origins = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv(
+        "ALLOWED_ORIGINS",
+        "http://localhost:5173,http://localhost:3000,https://dermamind.zeabur.app",
+    ).split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
